@@ -28,6 +28,7 @@ def get_local_version():
 
 
 
+
 def get_remote_version():
     """Получает version.txt из GitHub"""
     try:
