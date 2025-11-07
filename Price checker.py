@@ -11,6 +11,80 @@ from tkinter import ttk, scrolledtext
 import json, os
 import socket
 import uuid
+import subprocess
+
+
+def get_local_version():
+    """Читает локальный version.txt"""
+    try:
+        if not os.path.exists("version.txt"):
+            return "0"
+        return open("version.txt", encoding="utf-8").read().strip()
+    except Exception:
+        return "0"
+
+
+def get_remote_version():
+    """Получает version.txt из GitHub"""
+    try:
+        url = "https://raw.githubusercontent.com/wolfsum/POE/master/version.txt"
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200:
+            return r.text.strip()
+    except Exception as e:
+        log(f"⚠ Ошибка проверки версии: {e}")
+    return None
+
+
+def update_from_github():
+    """Скачивает свежий код с GitHub и перезапускает приложение."""
+    try:
+        code_url = "https://raw.githubusercontent.com/wolfsum/POE/master/Price%20checker.py"
+        r = requests.get(code_url, timeout=10)
+        if r.status_code == 200:
+            new_code = r.text
+            with open(__file__, "r", encoding="utf-8") as f:
+                old_code = f.read()
+
+            if new_code.strip() == old_code.strip():
+                log("🔸 Код не изменился — обновление не требуется.")
+                return
+
+            with open(__file__, "w", encoding="utf-8") as f:
+                f.write(new_code)
+
+            log("✅ Код обновлён. Перезапуск через 2 секунды...")
+
+            # Используем таймер, чтобы дать GUI завершиться
+            def restart_later():
+                python = sys.executable
+                os.execl(python, python, *sys.argv)
+
+            root.after(2000, restart_later)
+
+            # Закрываем интерфейс, чтобы обновление прошло чисто
+            root.destroy()
+        else:
+            log(f"❌ Ошибка скачивания кода: {r.status_code}")
+    except Exception as e:
+        log(f"❌ Ошибка обновления из GitHub: {e}")
+
+
+
+
+def check_version_and_update():
+    """Проверяет версию и обновляет при необходимости"""
+    local_ver = get_local_version()
+    remote_ver = get_remote_version()
+    if not remote_ver:
+        log("⚠ Не удалось получить удалённую версию.")
+        return
+
+    if remote_ver != local_ver:
+        log(f"🆕 Обнаружена новая версия {remote_ver} (у нас {local_ver}). Обновляем...")
+        update_from_github()
+    else:
+        log(f"🔹 Версия актуальна ({local_ver})")
 
 
 def generate_worker_id():
@@ -113,6 +187,68 @@ def mark_group_done(group_id):
     """, (group_id,))
     conn.commit()
     conn.close()
+
+
+def ensure_db_columns():
+    """Гарантирует наличие служебных полей и индексов для кластерной работы."""
+    try:
+        conn = psycopg2.connect(**DB)
+        cur = conn.cursor()
+
+        # collectors_status.restarting — флаг «кто сейчас делает сброс»
+        cur.execute("""
+            ALTER TABLE collectors_status
+            ADD COLUMN IF NOT EXISTS restarting BOOLEAN NOT NULL DEFAULT FALSE;
+        """)
+
+        # task_groups.retry_count — счётчик попыток перераспределения «зависших» групп
+        cur.execute("""
+            ALTER TABLE task_groups
+            ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+        """)
+
+        # На всякий — индексы, чтобы выборки шли шустрее
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relkind = 'i' AND c.relname = 'idx_collectors_status_active_lastseen'
+                ) THEN
+                    CREATE INDEX idx_collectors_status_active_lastseen
+                    ON collectors_status (active, last_seen);
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relkind = 'i' AND c.relname = 'idx_task_groups_completed_assigned'
+                ) THEN
+                    CREATE INDEX idx_task_groups_completed_assigned
+                    ON task_groups (completed, assigned_worker, assigned_at);
+                END IF;
+            END
+            $$;
+        """)
+
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        # если есть твой логгер — пишем туда
+        try:
+            log(f"⚠ ensure_db_columns: {e}")
+        except Exception:
+            print(f"[ensure_db_columns] {e}")
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 
 
@@ -446,6 +582,7 @@ def auto_loop():
 
     worker_id = get_or_create_worker_id()
     register_worker(worker_id)
+    ensure_db_columns() 
     log(f"✅ Воркер зарегистрирован: {worker_id}")
 
     league = league_cb.get().strip()
@@ -654,8 +791,11 @@ def auto_loop():
                     log(f"   {value} {currency} (продавец: {seller})")
 
             # --- завершение группы ---
+            # --- завершение группы ---
             mark_group_done(group_id)
             log(f"✅ Группа {group_id} завершена")
+            check_version_and_update()  # <-- сюда
+
 
         except Exception as e:
             log(f"Ошибка: {e}")
@@ -710,6 +850,7 @@ def start_auto_search():
         log("⚠ Автопоиск уже запущен.")
         return
 
+    check_version_and_update() 
     if 'worker_id' not in globals():
         worker_id = get_or_create_worker_id()
 
