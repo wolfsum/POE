@@ -970,6 +970,7 @@ def start_auto_search():
 
 
 
+
 btn_start.config(command=start_auto_search)
 btn_stop.config(command=stop_auto_search)
 
@@ -981,7 +982,7 @@ try:
     check_version_and_update()
 except Exception as e:
     log(f"⚠ Стартовая проверка версии: {e}")
-
+    
 # 🔹 Автостарт после рестарта, если autostart = True
 try:
     st = load_state()
