@@ -331,14 +331,16 @@ def save_state(state):
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 existing = json.load(f)
-        # сохраняем старый worker_id, если он уже был
-        if "worker_id" in existing and "worker_id" not in state:
-            state["worker_id"] = existing["worker_id"]
+        # сохраняем старые значения, если их нет
+        for key in ("worker_id", "autostart"):
+            if key in existing and key not in state:
+                state[key] = existing[key]
 
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log(f"Ошибка сохранения состояния: {e}")
+
 
 
 
@@ -847,6 +849,7 @@ def auto_loop():
 
 
 def stop_auto_search():
+    """Остановка автопоиска и деактивация воркера."""
     global auto_running
     if not auto_running:
         log("⚠ Автопоиск уже остановлен.")
@@ -856,6 +859,12 @@ def stop_auto_search():
     btn_start.config(state="normal")
     btn_stop.config(state="disabled")
 
+    # сбрасываем флаг автозапуска
+    st = load_state()
+    st["autostart"] = False
+    save_state(st)
+
+    # помечаем воркера как неактивного
     try:
         worker_id = get_or_create_worker_id()
         conn = psycopg2.connect(**DB)
@@ -871,6 +880,9 @@ def stop_auto_search():
     except Exception as e:
         log(f"Ошибка при остановке воркера: {e}")
 
+    log("⛔ Автопоиск остановлен.")
+
+
 
 def on_close():
     stop_auto_search()
@@ -880,12 +892,12 @@ root.protocol("WM_DELETE_WINDOW", on_close)
 
 
 def start_auto_search():
+    """Запуск автопоиска и сохранение состояния."""
     global auto_running, worker_id
     if auto_running:
         log("⚠ Автопоиск уже запущен.")
         return
 
-    check_version_and_update() 
     if 'worker_id' not in globals():
         worker_id = get_or_create_worker_id()
 
@@ -893,9 +905,21 @@ def start_auto_search():
     btn_start.config(state="disabled")
     btn_stop.config(state="normal")
 
-    start_heartbeat_thread(worker_id, interval=30) 
+    # сохраняем, что автопоиск активен (для автозапуска при рестарте)
+    st = load_state()
+    st["autostart"] = True
+    st["poesessid"] = session_entry.get().strip()
+    st["league"] = league_cb.get().strip()
+    st["status"] = status_cb.get().strip()
+    save_state(st)
+
+    # запускаем обновление last_seen в фоне
+    start_heartbeat_thread(worker_id, interval=30)
+
+    # запускаем основной цикл
     threading.Thread(target=auto_loop, daemon=True).start()
     log(f"▶ Запущен автопоиск для воркера: {worker_id}")
+
 
 
 
