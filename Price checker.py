@@ -15,13 +15,17 @@ import subprocess
 
 
 def get_local_version():
-    """Читает локальный version.txt"""
+    """Читает локальный version.txt, создаёт при отсутствии."""
     try:
         if not os.path.exists("version.txt"):
+            with open("version.txt", "w", encoding="utf-8") as f:
+                f.write("0")
             return "0"
         return open("version.txt", encoding="utf-8").read().strip()
-    except Exception:
+    except Exception as e:
+        log(f"⚠ Ошибка чтения version.txt: {e}")
         return "0"
+
 
 
 def get_remote_version():
