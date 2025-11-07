@@ -29,20 +29,26 @@ def get_local_version():
 
 
 def get_remote_version(max_retries=3, delay=3):
-    """Получает актуальную версию с GitHub с повторами."""
+    """Получает актуальную версию с GitHub с анти-кэшом."""
     url = "https://raw.githubusercontent.com/wolfsum/POE/master/version.txt"
-    headers = {"User-Agent": "PoE-AutoCollector/1.0"}
+    headers = {
+        "User-Agent": "PoE-AutoCollector/1.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, headers=headers, timeout=10)
+            r = requests.get(url, headers=headers, params={'_': int(time.time())}, timeout=10)
             if r.status_code == 200:
-                return r.text.strip().replace("\ufeff", "")
+                # убираем BOM и мусор
+                return r.text.replace("\ufeff", "").strip()
             else:
                 log(f"⚠ Ошибка при получении версии (код {r.status_code})")
         except Exception as e:
-            log(f"⚠ Попытка {attempt}/{max_retries}: ошибка {e}")
+            log(f"⚠ Попытка {attempt}/{max_retries}: {e}")
             time.sleep(delay)
     return None
+
 
 
 def update_local_version(new_version):
@@ -56,32 +62,41 @@ def update_local_version(new_version):
 
 
 def update_from_github():
-    """Скачивает свежий код и перезапускает приложение."""
+    """Скачивает свежий код и перезапускает приложение через новый процесс."""
     try:
         code_url = "https://raw.githubusercontent.com/wolfsum/POE/master/Price%20checker.py"
         version_url = "https://raw.githubusercontent.com/wolfsum/POE/master/version.txt"
-        headers = {"User-Agent": "PoE-AutoCollector/1.0"}
-
-        r_code = requests.get(code_url, headers=headers, timeout=10)
-        r_ver = requests.get(version_url, headers=headers, timeout=5)
+        headers = {
+            "User-Agent": "PoE-AutoCollector/1.0",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        # анти-кэш
+        ts = int(time.time())
+        r_code = requests.get(code_url, headers=headers, params={'_': ts}, timeout=15)
+        r_ver  = requests.get(version_url, headers=headers, params={'_': ts}, timeout=10)
 
         if r_code.status_code != 200:
             log(f"❌ Ошибка скачивания кода: {r_code.status_code}")
             return
 
         new_code = r_code.text
-        with open(__file__, "r", encoding="utf-8") as f:
-            old_code = f.read()
+        app_file = os.path.abspath(__file__)
 
-        # Если код не изменился — просто обновим версию
+        try:
+            with open(app_file, "r", encoding="utf-8") as f:
+                old_code = f.read()
+        except Exception:
+            old_code = ""
+
         if new_code.strip() == old_code.strip():
-            log("🔸 Код совпадает — просто обновляем версию.")
+            log("🔸 Код совпадает — обновляем только версию.")
             if r_ver.status_code == 200:
                 update_local_version(r_ver.text)
             return
 
-        # Записываем новый код
-        with open(__file__, "w", encoding="utf-8") as f:
+        # Пишем новый код в этот же файл
+        with open(app_file, "w", encoding="utf-8") as f:
             f.write(new_code)
         log("✅ Код обновлён.")
 
@@ -89,23 +104,21 @@ def update_from_github():
         if r_ver.status_code == 200:
             update_local_version(r_ver.text)
 
-        log("♻ Перезапуск через 2 секунды...")
-        def restart_later():
-            python = sys.executable
-            os.execl(python, python, *sys.argv)
-
-        try:
-            root.after(2000, restart_later)
-            root.destroy()
-        except Exception:
-            os.execl(sys.executable, sys.executable, *sys.argv)
+        log("♻ Перезапуск программы...")
+        # Стартуем новый процесс с теми же аргументами
+        python = sys.executable
+        args = [python] + sys.argv
+        subprocess.Popen(args, close_fds=True)
+        # Мгновенно выходим из текущего процесса (важно для Tkinter)
+        os._exit(0)
 
     except Exception as e:
         log(f"❌ Ошибка обновления из GitHub: {e}")
 
 
+
 def check_version_and_update():
-    """Проверяет локальную и удалённую версии, при необходимости обновляет."""
+    """Проверяет версию, с advisory-lock в БД, чтобы обновлял только один воркер."""
     local_ver = get_local_version()
     remote_ver = get_remote_version()
 
@@ -113,12 +126,45 @@ def check_version_and_update():
         log("⚠ Не удалось получить удалённую версию (GitHub недоступен).")
         return
 
-    # Сравниваем с очисткой BOM и пробелов
-    if remote_ver.strip() != local_ver.strip():
-        log(f"🆕 Обнаружена новая версия {remote_ver} (у нас {local_ver}). Обновляем...")
-        update_from_github()
-    else:
+    if remote_ver.strip() == local_ver.strip():
         log(f"🔹 Версия актуальна ({local_ver})")
+        return
+
+    # пробуем взять lock в БД: только один воркер реально обновляет
+    lock_key = 777001  # любое устойчивое число
+    got_lock = False
+    conn = None
+    try:
+        conn = psycopg2.connect(**DB)
+        cur = conn.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s);", (lock_key,))
+        got_lock = cur.fetchone()[0]
+        conn.commit()
+    except Exception as e:
+        log(f"⚠ Не удалось взять advisory lock: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    if not got_lock:
+        log(f"⌛ Обновление выполняет другой воркер. Ждём 10 сек...")
+        time.sleep(10)
+        return
+
+    try:
+        log(f"🆕 Найдена новая версия {remote_ver} (локально {local_ver}). Обновляем...")
+        update_from_github()
+    finally:
+        # Снять лок (если вдруг не перезапустились)
+        try:
+            conn = psycopg2.connect(**DB)
+            cur = conn.cursor()
+            cur.execute("SELECT pg_advisory_unlock(%s);", (lock_key,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
 
 
 
@@ -929,4 +975,28 @@ btn_stop.config(command=stop_auto_search)
 
 # ------------------ MAIN ------------------
 log("PoE Auto Price Collector готов к работе.")
+
+# 🔹 Проверяем версию при запуске (мягко, без блокировки)
+try:
+    check_version_and_update()
+except Exception as e:
+    log(f"⚠ Стартовая проверка версии: {e}")
+
+# 🔹 Автостарт после рестарта, если autostart = True
+try:
+    st = load_state()
+    if st.get("autostart"):
+        if st.get("poesessid"):
+            session_entry.delete(0, tk.END)
+            session_entry.insert(0, st["poesessid"])
+        if st.get("league"):
+            league_cb.set(st["league"])
+        if st.get("status"):
+            status_cb.set(st["status"])
+        start_auto_search()
+        log("⚙ Автостарт включен — автопоиск запущен после рестарта.")
+except Exception as e:
+    log(f"⚠ Ошибка автозапуска: {e}")
+
+# 🔹 Запуск GUI
 root.mainloop()
