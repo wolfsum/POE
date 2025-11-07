@@ -475,11 +475,17 @@ def search_items(name, base, league="Keepers", limit=1, status="securable",
     }
 
     query.setdefault("filters", {"misc_filters": {"filters": {}}})
+    
+    # Фильтр на порчу
     if corrupted_choice.lower() == "да":
         query["filters"]["misc_filters"]["filters"]["corrupted"] = {"option": True}
     elif corrupted_choice.lower() == "нет":
         query["filters"]["misc_filters"]["filters"]["corrupted"] = {"option": False}
 
+    # 🚫 Всегда исключаем Foulborn-предметы
+    query["filters"]["misc_filters"]["filters"]["foulborn_item"] = {"option": False}
+
+    # Фильтр по модификатору
     if stat_id:
         query["stats"][0]["filters"].append({
             "id": stat_id,
@@ -513,6 +519,7 @@ def search_items(name, base, league="Keepers", limit=1, status="securable",
         results.extend(r2.json().get("result", []))
         log(f"  Получено {len(results)} результатов (+{len(chunk)}) за {time.time()-start_chunk:.2f} сек")
     return results
+
 
 
 def parse_price_entry(entry):
