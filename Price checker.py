@@ -27,58 +27,72 @@ def get_local_version():
         return "0"
 
 
-
-
 def get_remote_version():
-    """Получает version.txt из GitHub"""
+    """Получает актуальную версию из GitHub."""
     try:
         url = "https://raw.githubusercontent.com/wolfsum/POE/master/version.txt"
         r = requests.get(url, timeout=5)
         if r.status_code == 200:
             return r.text.strip()
     except Exception as e:
-        log(f"⚠ Ошибка проверки версии: {e}")
+        log(f"⚠ Ошибка при проверке версии: {e}")
     return None
+
+
+def update_local_version(new_version):
+    """Записывает новую версию в version.txt."""
+    try:
+        with open("version.txt", "w", encoding="utf-8") as f:
+            f.write(str(new_version).strip())
+        log(f"💾 Локальная версия обновлена → {new_version}")
+    except Exception as e:
+        log(f"⚠ Ошибка записи version.txt: {e}")
 
 
 def update_from_github():
     """Скачивает свежий код с GitHub и перезапускает приложение."""
     try:
         code_url = "https://raw.githubusercontent.com/wolfsum/POE/master/Price%20checker.py"
-        r = requests.get(code_url, timeout=10)
-        if r.status_code == 200:
-            new_code = r.text
-            with open(__file__, "r", encoding="utf-8") as f:
-                old_code = f.read()
+        version_url = "https://raw.githubusercontent.com/wolfsum/POE/master/version.txt"
 
-            if new_code.strip() == old_code.strip():
-                log("🔸 Код не изменился — обновление не требуется.")
+        r_code = requests.get(code_url, timeout=10)
+        r_ver = requests.get(version_url, timeout=5)
+
+        if r_code.status_code == 200:
+            new_code = r_code.text
+            with open(__file__, "r", encoding="utf-8") as f:
+                current_code = f.read()
+
+            if new_code.strip() == current_code.strip():
+                log("🔸 Код совпадает — просто обновляем версию.")
+                if r_ver.status_code == 200:
+                    update_local_version(r_ver.text)
                 return
 
+            # перезаписываем сам себя
             with open(__file__, "w", encoding="utf-8") as f:
                 f.write(new_code)
+            log("✅ Код успешно обновлён.")
 
-            log("✅ Код обновлён. Перезапуск через 2 секунды...")
+            # обновляем версию в любом случае
+            if r_ver.status_code == 200:
+                update_local_version(r_ver.text)
 
-            # Используем таймер, чтобы дать GUI завершиться
+            log("♻ Перезапуск через 2 секунды...")
             def restart_later():
                 python = sys.executable
                 os.execl(python, python, *sys.argv)
 
             root.after(2000, restart_later)
-
-            # Закрываем интерфейс, чтобы обновление прошло чисто
             root.destroy()
         else:
-            log(f"❌ Ошибка скачивания кода: {r.status_code}")
+            log(f"❌ Ошибка скачивания кода: {r_code.status_code}")
     except Exception as e:
         log(f"❌ Ошибка обновления из GitHub: {e}")
 
 
-
-
 def check_version_and_update():
-    """Проверяет версию и обновляет при необходимости"""
+    """Проверяет локальную и удалённую версии, при необходимости обновляет."""
     local_ver = get_local_version()
     remote_ver = get_remote_version()
     if not remote_ver:
@@ -90,6 +104,7 @@ def check_version_and_update():
         update_from_github()
     else:
         log(f"🔹 Версия актуальна ({local_ver})")
+
 
 
 def generate_worker_id():
