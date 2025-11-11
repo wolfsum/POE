@@ -396,6 +396,29 @@ def log(msg: str):
     output_box.insert(tk.END, f"[{now_time()}] {msg}\n")
     output_box.see(tk.END)
     output_box.update()
+    
+# ------------------ ПАНЕЛЬ СОСТОЯНИЯ ------------------
+def update_status_bar():
+    """Обновляет нижнюю панель во время работы"""
+    global processed_items, processed_forced, start_time, current_group_id
+
+    if not auto_running or not start_time:
+        status_label.config(text="⛔ Остановлено")
+        info_label.config(text="")
+        return
+
+    elapsed = time.time() - start_time
+    hrs, rem = divmod(int(elapsed), 3600)
+    mins, secs = divmod(rem, 60)
+    uptime_str = f"{hrs:02}:{mins:02}:{secs:02}"
+
+    status_label.config(text="🟢 Работает")
+    info_label.config(
+        text=f"⏱ {uptime_str} | ⚙ Проверено: {processed_items:,} (форс: {processed_forced:,}) | 📦 Группа: {current_group_id or '—'}"
+    )
+
+    root.after(1000, update_status_bar)
+
 
 
 # ------------------ API ------------------
@@ -409,18 +432,29 @@ def get_delay_from_headers(headers):
     return None
 
 
-def safe_request(method, url, **kwargs):
-    """Безопасный запрос с фиксированной задержкой"""
-    while True:
-        r = requests.request(method, url, **kwargs)
-        if r.status_code == 429:
-            wait_time = get_delay_from_headers(r.headers) or 60
-            log(f"[RateLimit] Превышен лимит, ждём {wait_time:.1f} сек...")
-            time.sleep(wait_time)
-            continue
-        r.raise_for_status()
-        time.sleep(REQUEST_DELAY_SECONDS)
-        return r
+def safe_request(method, url, retries=3, **kwargs):
+    """Безопасный запрос с фиксированной задержкой и повтором при сетевых ошибках"""
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.request(method, url, **kwargs)
+            if r.status_code == 429:
+                wait_time = get_delay_from_headers(r.headers) or 60
+                log(f"[RateLimit] Превышен лимит, ждём {wait_time:.1f} сек...")
+                time.sleep(wait_time)
+                continue
+            r.raise_for_status()
+            time.sleep(REQUEST_DELAY_SECONDS)
+            return r
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.SSLError) as e:
+            log(f"⚠ Ошибка сети ({attempt}/{retries}): {e}")
+            time.sleep(5 * attempt)
+        except Exception as e:
+            log(f"⚠ Ошибка запроса ({attempt}/{retries}): {e}")
+            time.sleep(5 * attempt)
+    raise Exception("❌ Повторы исчерпаны — соединение с API потеряно.")
+
 
 
 def get_leagues_list():
@@ -515,7 +549,7 @@ def search_items(name, base, league="Keepers", limit=1, status="securable",
         fetch_url = f"{TRADE_API}/fetch/{','.join(chunk)}?query={data['id']}"
         log(f"  Fetch {i+1}-{i+len(chunk)}")
         start_chunk = time.time()
-        r2 = safe_request("GET", fetch_url, headers=headers, cookies=cookies, timeout=10)
+        r2 = safe_request("GET", fetch_url, headers=headers, cookies=cookies, timeout=30)
         results.extend(r2.json().get("result", []))
         log(f"  Получено {len(results)} результатов (+{len(chunk)}) за {time.time()-start_chunk:.2f} сек")
     return results
@@ -573,6 +607,7 @@ def get_next_row_after(last_id, item_type_filter=None):
         conn.close()
 
 
+
 def update_price_in_db(row_id, value, currency, seller, league=DEFAULT_LEAGUE):
     conn = psycopg2.connect(**DB)
     cur = conn.cursor()
@@ -587,6 +622,7 @@ def update_price_in_db(row_id, value, currency, seller, league=DEFAULT_LEAGUE):
     """, (value, currency, seller, league, row_id))
     conn.commit()
     conn.close()
+
 
 
 def deactivate_stale_workers():
@@ -607,6 +643,62 @@ def deactivate_stale_workers():
             log(f"⚠ Деактивировано воркеров: {affected}")
     except Exception as e:
         log(f"Ошибка при деактивации неактивных воркеров: {e}")
+
+
+def reset_stale_forced_items():
+    conn = psycopg2.connect(**DB)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE force_update_queue
+        SET in_progress = FALSE
+        WHERE in_progress = TRUE
+          AND created_at < NOW() - INTERVAL '10 minutes';
+    """)
+    affected = cur.rowcount
+    conn.commit()
+    conn.close()
+    if affected:
+        log(f"♻ Сброшено зависших форс-заданий: {affected}")
+
+
+
+
+def get_forced_items(limit=10):
+    """Возвращает список item_id для принудительного обновления и ставит им блокировку."""
+    conn = psycopg2.connect(**DB)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE force_update_queue
+        SET in_progress = TRUE
+        WHERE item_id IN (
+            SELECT item_id FROM force_update_queue
+            WHERE processed = FALSE
+              AND (in_progress = FALSE OR in_progress IS NULL)
+            ORDER BY created_at
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING item_id;
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.commit()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def mark_forced_done(item_ids):
+    """Помечает элементы из force_update_queue как обработанные."""
+    if not item_ids:
+        return
+    conn = psycopg2.connect(**DB)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE force_update_queue
+        SET processed = TRUE, in_progress = FALSE
+        WHERE item_id = ANY(%s);
+    """, (item_ids,))
+    conn.commit()
+    conn.close()
 
 
 # ------------------ GUI ------------------
@@ -647,6 +739,14 @@ btn_stop.grid(row=0, column=7, padx=5)
 output_box = scrolledtext.ScrolledText(root, wrap=tk.WORD, font=("Consolas", 10))
 output_box.pack(fill="both", expand=True, padx=5, pady=5)
 
+status_frame = ttk.Frame(root, padding=3)
+status_frame.pack(fill="x", side="bottom")
+
+status_label = ttk.Label(status_frame, text="⏸ Не запущено", font=("Consolas", 10))
+status_label.pack(side="left")
+
+info_label = ttk.Label(status_frame, text="", font=("Consolas", 10))
+info_label.pack(side="right")
 
 
 
@@ -665,10 +765,13 @@ if state:
 
 # ------------------ ЛОГИКА ------------------
 auto_running = False
-
+processed_items = 0
+processed_forced = 0
+start_time = None
+current_group_id = None
 
 def auto_loop():
-    global auto_running
+    global auto_running, processed_items, processed_forced, current_group_id
 
     worker_id = get_or_create_worker_id()
     register_worker(worker_id)
@@ -764,6 +867,67 @@ def auto_loop():
     while auto_running:
         try:
             now = time.time()
+            reset_stale_forced_items()
+            forced_ids = get_forced_items(limit=10)
+            if forced_ids:
+                log(f"⚡ Найдено {len(forced_ids)} позиций для принудительного обновления.")
+                success_ids, failed_ids = [], []
+            
+                for item_id in forced_ids:
+                    try:
+                        conn = psycopg2.connect(**DB)
+                        cur = conn.cursor()
+                        cur.execute("""
+                            SELECT i.id, i.item_name, i.base_type, i.mod_description,
+                                i.stat_id, ui.item_type
+                            FROM trade_prices AS i
+                            LEFT JOIN unique_items AS ui ON ui.name = i.item_name
+                            WHERE i.id = %s;
+                        """, (item_id,))
+                        row = cur.fetchone()
+                        conn.close()
+                        if not row:
+                            log(f"❌ ID {item_id} не найден в trade_prices.")
+                            failed_ids.append(item_id)
+                            continue
+            
+                        row_id, name, base, mod, stat_id, item_type = row
+                        log(f"⚙ Форс-апдейт {row_id}: {name} ({base}), тип: {item_type}, мод: {mod}")
+            
+                        results = search_items(name, base, league, 1, status, "да", stat_id, session_id)
+                        if not results:
+                            update_price_in_db(row_id, None, None, None, league)
+                            log("   Не найдено (форс-апдейт)")
+                        else:
+                            value, currency, seller = parse_price_entry(results[0])
+                            update_price_in_db(row_id, value, currency, seller, league)
+                            log(f"   ✅ {value} {currency} (форс-апдейт, продавец: {seller})")
+            
+                        success_ids.append(item_id)
+            
+                    except Exception as e:
+                        log(f"❌ Ошибка при форс-апдейте {item_id}: {e}")
+                        failed_ids.append(item_id)
+            
+                # успешно завершённые
+                if success_ids:
+                    mark_forced_done(success_ids)
+                    log(f"⚡ Успешно обновлено: {len(success_ids)}")
+            
+                # вернуть неудачные
+                if failed_ids:
+                    conn = psycopg2.connect(**DB)
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE force_update_queue
+                        SET in_progress = FALSE
+                        WHERE item_id = ANY(%s);
+                    """, (failed_ids,))
+                    conn.commit()
+                    conn.close()
+                    log(f"🔁 Возвращено на повторную обработку: {len(failed_ids)}")
+            
+                continue  # к следующей итерации
 
             # каждые 2 минуты чистим неактивных воркеров и зависшие группы
             if now - last_recheck > 120:
@@ -835,6 +999,7 @@ def auto_loop():
 
             group_id, start_id, end_id = group
             log(f"📦 Получена группа {group_id}: ID {start_id}-{end_id}")
+            current_group_id = group_id
 
             # фиксируем назначение в collectors_status
             try:
@@ -870,15 +1035,23 @@ def auto_loop():
                 if not auto_running:
                     break
                 log(f"→ {row_id}: {name} ({base}), тип: {item_type}, мод: {mod}")
+            
+                try:
+                    results = search_items(name, base, league, 1, status, "да", stat_id, session_id)
+                    if not results:
+                        update_price_in_db(row_id, None, None, None, league)
+                        log("   Не найдено")
+                    else:
+                        value, currency, seller = parse_price_entry(results[0])
+                        update_price_in_db(row_id, value, currency, seller, league)
+                        processed_items += 1
+                        log(f"   {value} {currency} (продавец: {seller})")
+                except Exception as e:
+                    log(f"⚠ Ошибка при обработке {row_id}: {e}")
+                    # чтобы предмет не считался “выполненным” — повторим его позже
+                    time.sleep(5)
+                    continue
 
-                results = search_items(name, base, league, 1, status, "да", stat_id, session_id)
-                if not results:
-                    update_price_in_db(row_id, None, None, None, league)
-                    log("   Не найдено")
-                else:
-                    value, currency, seller = parse_price_entry(results[0])
-                    update_price_in_db(row_id, value, currency, seller, league)
-                    log(f"   {value} {currency} (продавец: {seller})")
 
             # --- завершение группы ---
             # --- завершение группы ---
@@ -934,6 +1107,8 @@ def stop_auto_search():
         log(f"Ошибка при остановке воркера: {e}")
 
     log("⛔ Автопоиск остановлен.")
+    status_label.config(text="⛔ Остановлено")
+    info_label.config(text="")
 
 
 
@@ -947,6 +1122,12 @@ root.protocol("WM_DELETE_WINDOW", on_close)
 def start_auto_search():
     """Запуск автопоиска и сохранение состояния."""
     global auto_running, worker_id
+    global start_time, processed_items, processed_forced, current_group_id
+    start_time = time.time()
+    processed_items = 0
+    processed_forced = 0
+    current_group_id = None
+    root.after(1000, update_status_bar)
     if auto_running:
         log("⚠ Автопоиск уже запущен.")
         return
