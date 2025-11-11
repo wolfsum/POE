@@ -416,8 +416,47 @@ def update_status_bar():
     info_label.config(
         text=f"⏱ {uptime_str} | ⚙ Проверено: {processed_items:,} (форс: {processed_forced:,}) | 📦 Группа: {current_group_id or '—'}"
     )
-
     root.after(1000, update_status_bar)
+
+
+def update_limits_bar():
+    """
+    Показывает три окна лимитов (10 / 60 / 300 сек).
+    Загрузка — по наибольшему проценту.
+    """
+    try:
+        if current_limits and current_states:
+            parsed = []
+            for lim, st in zip(current_limits, current_states):
+                try:
+                    a, w, _ = map(int, lim.split(":")[:3])
+                    u, w2, _ = map(int, st.split(":")[:3])
+                    if w == w2 and w in (10, 60, 300):
+                        parsed.append((a, u, w))
+                except Exception:
+                    continue
+
+            if not parsed:
+                limits_label.config(text=f"🌐 Лимиты: не определены | ⏱ {REQUEST_DELAY_SECONDS:.1f}с")
+                return
+
+            parsed.sort(key=lambda x: x[2])
+            cur_vals = [str(u) for (_, u, _) in parsed]
+            max_vals = [str(a) for (a, _, _) in parsed]
+
+            load = int(round(max_usage_cache * 100))
+            icon = "🟢" if load < 50 else ("🟡" if load < 80 else "🔴")
+
+            limits_label.config(
+                text=f"{icon} Текущие: {'-'.join(cur_vals)}  |  Предел: {'-'.join(max_vals)}  |  Загрузка: {load}%  |  ⏱ {REQUEST_DELAY_SECONDS:.1f}с"
+            )
+        else:
+            limits_label.config(text=f"🌐 Лимиты: не определены | ⏱ {REQUEST_DELAY_SECONDS:.1f}с")
+    except Exception as e:
+        limits_label.config(text=f"🌐 Ошибка лимитов: {e}")
+
+    if auto_running:
+        root.after(5000, update_limits_bar)
 
 
 
@@ -431,6 +470,11 @@ def get_delay_from_headers(headers):
             pass
     return None
 
+# ------------------ RATE LIMIT ------------------
+current_limits = []
+current_states = []
+REQUEST_DELAY_SECONDS = 6.0
+
 
 def safe_request(method, url, retries=3, **kwargs):
     """Безопасный запрос с фиксированной задержкой и повтором при сетевых ошибках"""
@@ -443,6 +487,7 @@ def safe_request(method, url, retries=3, **kwargs):
                 time.sleep(wait_time)
                 continue
             r.raise_for_status()
+            update_limits_from_response(r)
             time.sleep(REQUEST_DELAY_SECONDS)
             return r
         except (requests.exceptions.Timeout,
@@ -454,6 +499,74 @@ def safe_request(method, url, retries=3, **kwargs):
             log(f"⚠ Ошибка запроса ({attempt}/{retries}): {e}")
             time.sleep(5 * attempt)
     raise Exception("❌ Повторы исчерпаны — соединение с API потеряно.")
+
+
+# --- RL state ---
+TARGET_WINDOWS = (60, 300, 1800)   # работаем только по этим окнам
+last_limit_signature = None
+last_adjust_ts = 0.0
+avg_usage_cache = 0.0
+
+# для панели
+selected_limits = {}  # window -> (allowed, used, penalty)
+
+
+def update_limits_from_response(r):
+    """
+    Читает реальные три лимита (10, 60, 300 сек).
+    Игнорирует мусор, адаптирует паузу по максимальной загрузке.
+    """
+    global current_limits, current_states, REQUEST_DELAY_SECONDS, max_usage_cache
+
+    lim = r.headers.get("X-Rate-Limit-Ip")
+    st = r.headers.get("X-Rate-Limit-Ip-State")
+    if not lim or not st:
+        return
+
+    raw = []
+    for l, s in zip(lim.split(","), st.split(",")):
+        try:
+            a, w, p = map(int, l.split(":")[:3])
+            u, w2, _ = map(int, s.split(":")[:3])
+            if w == w2 and w in (10, 60, 300):
+                raw.append((a, u, w))
+        except Exception:
+            continue
+
+    if not raw:
+        return
+
+    raw.sort(key=lambda x: x[2])
+    current_limits = [f"{a}:{w}:0" for (a, u, w) in raw]
+    current_states = [f"{u}:{w}:0" for (a, u, w) in raw]
+
+    # нагрузка по каждому окну, выбираем наибольшую
+    usages = [u / a for (a, u, w) in raw if a > 0]
+    max_usage = max(usages)
+    max_usage_cache = max_usage
+
+    # базовая пауза от самого длинного окна (гарантия)
+    base_delay = max(w / a for (a, u, w) in raw)
+
+    # 🔸 Адаптация по порогам
+    if max_usage < 0.6:
+        # быстрое ускорение (до минимума 2.5 сек)
+        new_delay = max(2.5, REQUEST_DELAY_SECONDS * 0.9)
+    elif max_usage < 0.8:
+        # мягкая стабилизация (не трогаем особо)
+        new_delay = REQUEST_DELAY_SECONDS
+    else:
+        # ощутимое замедление — “охлаждение” лимитов
+        new_delay = min(15.0, REQUEST_DELAY_SECONDS * 1.4)
+
+    # округляем и обновляем, если изменилось заметно
+    new_delay = round(new_delay, 1)
+    if abs(new_delay - REQUEST_DELAY_SECONDS) >= 0.4:
+        old = REQUEST_DELAY_SECONDS
+        REQUEST_DELAY_SECONDS = new_delay
+        log(f"🌐 Пауза адаптирована: {old:.1f}s → {REQUEST_DELAY_SECONDS:.1f}s (нагрузка {max_usage*100:.0f}%)")
+
+
 
 
 
@@ -728,6 +841,18 @@ ttk.Label(frame_top, text="POESESSID (опционально):").grid(row=0, col
 session_entry = ttk.Entry(frame_top, width=40)
 session_entry.grid(row=0, column=5, padx=5)
 
+# --- Включаем поддержку Ctrl+C / Ctrl+V / Ctrl+X для поля POESESSID ---
+def bind_clipboard_shortcuts(widget):
+    widget.bind("<Control-c>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-C>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-v>", lambda e: widget.event_generate("<<Paste>>"))
+    widget.bind("<Control-V>", lambda e: widget.event_generate("<<Paste>>"))
+    widget.bind("<Control-x>", lambda e: widget.event_generate("<<Cut>>"))
+    widget.bind("<Control-X>", lambda e: widget.event_generate("<<Cut>>"))
+
+bind_clipboard_shortcuts(session_entry)
+
+
 # Кнопки
 btn_start = ttk.Button(frame_top, text="▶ Запустить автопоиск")
 btn_start.grid(row=0, column=6, padx=10)
@@ -747,7 +872,8 @@ status_label.pack(side="left")
 
 info_label = ttk.Label(status_frame, text="", font=("Consolas", 10))
 info_label.pack(side="right")
-
+limits_label = ttk.Label(status_frame, text="🌐 Лимиты: не определены", font=("Consolas", 9))
+limits_label.pack(side="bottom", anchor="w", padx=5)
 
 
 
@@ -1120,6 +1246,7 @@ root.protocol("WM_DELETE_WINDOW", on_close)
 
 
 def start_auto_search():
+    root.after(1000, update_limits_bar)
     """Запуск автопоиска и сохранение состояния."""
     global auto_running, worker_id
     global start_time, processed_items, processed_forced, current_group_id
@@ -1153,9 +1280,7 @@ def start_auto_search():
     # запускаем основной цикл
     threading.Thread(target=auto_loop, daemon=True).start()
     log(f"▶ Запущен автопоиск для воркера: {worker_id}")
-
-
-
+    root.after(1000, update_limits_bar)
 
 
 
