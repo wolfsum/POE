@@ -523,11 +523,8 @@ active_pool = "—"   # Account / IP / —
 
 
 def update_limits_from_response(r):
-    """
-    Универсальная версия: поддерживает Account и IP лимиты,
-    совместима с панелью, всегда обновляет current_limits/current_states.
-    """
-    global current_limits, current_states, REQUEST_DELAY_SECONDS, max_usage_cache
+    """Простая и стабильная адаптация задержки по лимитам PoE API."""
+    global current_limits, current_states, REQUEST_DELAY_SECONDS, max_usage_cache, active_pool
 
     lim_acc = r.headers.get("X-Rate-Limit-Account")
     st_acc  = r.headers.get("X-Rate-Limit-Account-State")
@@ -535,63 +532,61 @@ def update_limits_from_response(r):
     st_ip   = r.headers.get("X-Rate-Limit-Ip-State")
 
     def parse(lim, st):
-        out = []
         if not lim or not st:
-            return out
-        # len(lim) может не равняться len(st), поэтому zip_longest
-        from itertools import zip_longest
-        for l, s in zip_longest(lim.split(","), st.split(","), fillvalue="0:0:0"):
+            return []
+        out = []
+        for l, s in zip(lim.split(","), st.split(",")):
             try:
                 a, w, _ = map(int, l.split(":")[:3])
                 u, w2, _ = map(int, s.split(":")[:3])
                 if w == w2 and w in (10, 60, 300):
                     out.append((a, u, w))
-            except Exception:
+            except:
                 continue
         return out
 
     acc = parse(lim_acc, st_acc)
     ip  = parse(lim_ip, st_ip)
 
-    if not acc and not ip:
-        return  # нет лимитов вообще — не трогаем
-
-    # выбираем наиболее активный пул
-    def usage(pool):
-        return max((u / a) for (a, u, w) in pool if a > 0) if pool else 0
-
-    acc_usage = usage(acc)
-    ip_usage  = usage(ip)
-
-    if acc and (acc_usage >= ip_usage or not ip):
+    # приоритет: Account > IP
+    if acc:
         raw = acc
-    else:
+        active_pool = "Account"
+    elif ip:
         raw = ip
-
-    # если оба пустые — ничего не обновляем
-    if not raw:
+        active_pool = "IP"
+    else:
         return
 
+    # рассчитываем загрузку
+    usages = [u / a for (a, u, w) in raw if a > 0]
+    if not usages:
+        return
+
+    max_usage_cache = max(usages)
+    base_delay = max(w / a for (a, u, w) in raw)
+
+    old_delay = REQUEST_DELAY_SECONDS
+
+    # простая адаптация
+    if max_usage_cache < 0.6:
+        new_delay = max(2.5, old_delay * 0.9)
+    elif max_usage_cache < 0.8:
+        new_delay = old_delay
+    else:
+        new_delay = min(15.0, old_delay * 1.3)
+
+    new_delay = round(new_delay, 1)
+
+    if abs(new_delay - old_delay) >= 0.2:
+        REQUEST_DELAY_SECONDS = new_delay
+        log(f"🌐 Пауза адаптирована: {old_delay:.1f}s → {new_delay:.1f}s "
+            f"(нагрузка {max_usage_cache*100:.0f}%, пул: {active_pool})")
+
+    # обновляем текущие лимиты для панели
     raw.sort(key=lambda x: x[2])
     current_limits = [f"{a}:{w}:0" for (a, u, w) in raw]
     current_states = [f"{u}:{w}:0" for (a, u, w) in raw]
-
-    usages = [u / a for (a, u, w) in raw if a > 0]
-    max_usage_cache = max(usages)
-
-    base_delay = max(w / a for (a, u, w) in raw)
-    if max_usage_cache < 0.6:
-        new_delay = max(2.5, REQUEST_DELAY_SECONDS * 0.9)
-    elif max_usage_cache < 0.8:
-        new_delay = REQUEST_DELAY_SECONDS
-    else:
-        new_delay = min(15.0, REQUEST_DELAY_SECONDS * 1.4)
-
-    new_delay = round(new_delay, 1)
-    if abs(new_delay - REQUEST_DELAY_SECONDS) >= 0.4:
-        old = REQUEST_DELAY_SECONDS
-        REQUEST_DELAY_SECONDS = new_delay
-        log(f"🌐 Пауза адаптирована: {old:.1f}s → {REQUEST_DELAY_SECONDS:.1f}s (нагрузка {max_usage_cache*100:.0f}%)")
 
 
 
