@@ -12,6 +12,7 @@ import json, os
 import socket
 import uuid
 import subprocess
+from threading import Lock
 
 
 def get_local_version():
@@ -487,7 +488,10 @@ def safe_request(method, url, retries=3, **kwargs):
                 time.sleep(wait_time)
                 continue
             r.raise_for_status()
-            update_limits_from_response(r)
+            try:
+                update_limits_from_response(r)
+            except Exception as e:
+                log(f"[RateLimit] Ошибка при обновлении лимитов: {e}")
             time.sleep(REQUEST_DELAY_SECONDS)
             return r
         except (requests.exceptions.Timeout,
@@ -511,28 +515,60 @@ avg_usage_cache = 0.0
 selected_limits = {}  # window -> (allowed, used, penalty)
 
 
+# --- RATE LIMIT --- 
+current_limits = []
+current_states = []
+max_usage_cache = 0.0
+active_pool = "—"   # Account / IP / —
+
+
 def update_limits_from_response(r):
     """
-    Читает реальные три лимита (10, 60, 300 сек).
-    Игнорирует мусор, адаптирует паузу по максимальной загрузке.
+    Универсальная версия: поддерживает Account и IP лимиты,
+    совместима с панелью, всегда обновляет current_limits/current_states.
     """
     global current_limits, current_states, REQUEST_DELAY_SECONDS, max_usage_cache
 
-    lim = r.headers.get("X-Rate-Limit-Ip")
-    st = r.headers.get("X-Rate-Limit-Ip-State")
-    if not lim or not st:
-        return
+    lim_acc = r.headers.get("X-Rate-Limit-Account")
+    st_acc  = r.headers.get("X-Rate-Limit-Account-State")
+    lim_ip  = r.headers.get("X-Rate-Limit-Ip")
+    st_ip   = r.headers.get("X-Rate-Limit-Ip-State")
 
-    raw = []
-    for l, s in zip(lim.split(","), st.split(",")):
-        try:
-            a, w, p = map(int, l.split(":")[:3])
-            u, w2, _ = map(int, s.split(":")[:3])
-            if w == w2 and w in (10, 60, 300):
-                raw.append((a, u, w))
-        except Exception:
-            continue
+    def parse(lim, st):
+        out = []
+        if not lim or not st:
+            return out
+        # len(lim) может не равняться len(st), поэтому zip_longest
+        from itertools import zip_longest
+        for l, s in zip_longest(lim.split(","), st.split(","), fillvalue="0:0:0"):
+            try:
+                a, w, _ = map(int, l.split(":")[:3])
+                u, w2, _ = map(int, s.split(":")[:3])
+                if w == w2 and w in (10, 60, 300):
+                    out.append((a, u, w))
+            except Exception:
+                continue
+        return out
 
+    acc = parse(lim_acc, st_acc)
+    ip  = parse(lim_ip, st_ip)
+
+    if not acc and not ip:
+        return  # нет лимитов вообще — не трогаем
+
+    # выбираем наиболее активный пул
+    def usage(pool):
+        return max((u / a) for (a, u, w) in pool if a > 0) if pool else 0
+
+    acc_usage = usage(acc)
+    ip_usage  = usage(ip)
+
+    if acc and (acc_usage >= ip_usage or not ip):
+        raw = acc
+    else:
+        raw = ip
+
+    # если оба пустые — ничего не обновляем
     if not raw:
         return
 
@@ -540,31 +576,22 @@ def update_limits_from_response(r):
     current_limits = [f"{a}:{w}:0" for (a, u, w) in raw]
     current_states = [f"{u}:{w}:0" for (a, u, w) in raw]
 
-    # нагрузка по каждому окну, выбираем наибольшую
     usages = [u / a for (a, u, w) in raw if a > 0]
-    max_usage = max(usages)
-    max_usage_cache = max_usage
+    max_usage_cache = max(usages)
 
-    # базовая пауза от самого длинного окна (гарантия)
     base_delay = max(w / a for (a, u, w) in raw)
-
-    # 🔸 Адаптация по порогам
-    if max_usage < 0.6:
-        # быстрое ускорение (до минимума 2.5 сек)
+    if max_usage_cache < 0.6:
         new_delay = max(2.5, REQUEST_DELAY_SECONDS * 0.9)
-    elif max_usage < 0.8:
-        # мягкая стабилизация (не трогаем особо)
+    elif max_usage_cache < 0.8:
         new_delay = REQUEST_DELAY_SECONDS
     else:
-        # ощутимое замедление — “охлаждение” лимитов
         new_delay = min(15.0, REQUEST_DELAY_SECONDS * 1.4)
 
-    # округляем и обновляем, если изменилось заметно
     new_delay = round(new_delay, 1)
     if abs(new_delay - REQUEST_DELAY_SECONDS) >= 0.4:
         old = REQUEST_DELAY_SECONDS
         REQUEST_DELAY_SECONDS = new_delay
-        log(f"🌐 Пауза адаптирована: {old:.1f}s → {REQUEST_DELAY_SECONDS:.1f}s (нагрузка {max_usage*100:.0f}%)")
+        log(f"🌐 Пауза адаптирована: {old:.1f}s → {REQUEST_DELAY_SECONDS:.1f}s (нагрузка {max_usage_cache*100:.0f}%)")
 
 
 
