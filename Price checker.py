@@ -570,7 +570,7 @@ def update_limits_from_response(r):
 
     # простая адаптация
     if max_usage_cache < 0.6:
-        new_delay = max(2.5, old_delay * 0.9)
+        new_delay = max(1.5, old_delay * 0.9)
     elif max_usage_cache < 0.8:
         new_delay = old_delay
     else:
@@ -865,12 +865,20 @@ session_entry.grid(row=0, column=5, padx=5)
 
 # --- Включаем поддержку Ctrl+C / Ctrl+V / Ctrl+X для поля POESESSID ---
 def bind_clipboard_shortcuts(widget):
-    widget.bind("<Control-c>", lambda e: widget.event_generate("<<Copy>>"))
-    widget.bind("<Control-C>", lambda e: widget.event_generate("<<Copy>>"))
-    widget.bind("<Control-v>", lambda e: widget.event_generate("<<Paste>>"))
-    widget.bind("<Control-V>", lambda e: widget.event_generate("<<Paste>>"))
-    widget.bind("<Control-x>", lambda e: widget.event_generate("<<Cut>>"))
-    widget.bind("<Control-X>", lambda e: widget.event_generate("<<Cut>>"))
+    def handler(event):
+        # event.keycode универсален для Ctrl+C/V/X
+        # Windows: C=67, V=86, X=88
+        # Linux/Mac примерно те же
+        if event.keycode in (67, 86, 88):
+            if event.keycode == 67:      # C
+                widget.event_generate("<<Copy>>")
+            elif event.keycode == 86:    # V
+                widget.event_generate("<<Paste>>")
+            elif event.keycode == 88:    # X
+                widget.event_generate("<<Cut>>")
+        return "break"  # чтобы не дублировать
+
+    widget.bind("<Control-Key>", handler)
 
 bind_clipboard_shortcuts(session_entry)
 
