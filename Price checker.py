@@ -990,29 +990,41 @@ def auto_loop():
             log(f"Ошибка при деактивации неактивных воркеров: {e}")
 
     def release_stale_groups():
-        """Освобождает зависшие группы, если воркер не активен более 2 минут."""
+        """
+        Освобождаем группы ТОЛЬКО мёртвых воркеров,
+        И ТОЛЬКО если assigned_at реально старше 3 минут.
+        """
         try:
             conn = psycopg2.connect(**DB)
             cur = conn.cursor()
+    
             cur.execute("""
-                UPDATE task_groups
+                UPDATE task_groups tg
                 SET assigned_worker = NULL,
                     assigned_at = NULL,
                     retry_count = retry_count + 1
-                WHERE completed = FALSE
-                  AND assigned_worker IN (
-                      SELECT worker_id FROM collectors_status
-                      WHERE active = FALSE
-                         OR last_seen < NOW() - INTERVAL '2 minutes'
-                  );
+                WHERE tg.completed = FALSE
+                AND tg.assigned_worker IN (
+                    SELECT worker_id
+                    FROM collectors_status
+                    WHERE active = FALSE
+                    OR last_seen < NOW() - INTERVAL '2 minutes'
+                )
+                AND tg.assigned_worker IS NOT NULL
+                AND tg.assigned_at < NOW() - INTERVAL '3 minutes';
             """)
+    
             released = cur.rowcount
             conn.commit()
             conn.close()
+    
             if released > 0:
                 log(f"⚠ Освобождено зависших групп: {released}")
+    
         except Exception as e:
             log(f"Ошибка при проверке зависших групп: {e}")
+
+
 
     # --- основной цикл ---
     last_recheck = 0
