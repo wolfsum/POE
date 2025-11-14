@@ -226,7 +226,10 @@ def start_heartbeat_thread(worker_id, interval=30):
 
 
 def assign_group(worker_id):
-    """Назначает свободную или застрявшую группу воркеру"""
+    """Назначает СВОБОДНУЮ группу воркеру.
+    НЕ трогает группы, которые уже назначены живым воркерам.
+    Перераспределение только через release_stale_groups().
+    """
     conn = psycopg2.connect(**DB)
     cur = conn.cursor()
     cur.execute("""
@@ -236,9 +239,10 @@ def assign_group(worker_id):
             WHERE completed = FALSE
               AND (
                   assigned_worker IS NULL
-                  OR assigned_at < NOW() - INTERVAL '3 minutes'
+                  -- либо группа у мёртвого воркера
                   OR assigned_worker IN (
-                      SELECT worker_id FROM collectors_status
+                      SELECT worker_id
+                      FROM collectors_status
                       WHERE active = FALSE
                          OR last_seen < NOW() - INTERVAL '2 minutes'
                   )
@@ -257,6 +261,7 @@ def assign_group(worker_id):
     conn.commit()
     conn.close()
     return row
+
 
 
 def mark_group_done(group_id):
@@ -570,8 +575,8 @@ def update_limits_from_response(r):
 
     # простая адаптация
     if max_usage_cache < 0.6:
-        new_delay = max(1.5, old_delay * 0.9)
-    elif max_usage_cache < 0.8:
+        new_delay = max(0.5, old_delay * 0.9)
+    elif max_usage_cache < 0.75:
         new_delay = old_delay
     else:
         new_delay = min(15.0, old_delay * 1.3)
