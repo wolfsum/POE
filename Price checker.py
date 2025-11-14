@@ -1070,7 +1070,8 @@ def auto_loop():
             forced_ids = get_forced_items(limit=10)
             if forced_ids:
                 log(f"⚡ Найдено {len(forced_ids)} позиций для принудительного обновления.")
-                success_ids, failed_ids = [], []
+            
+                processed_all = []
             
                 for item_id in forced_ids:
                     try:
@@ -1085,48 +1086,66 @@ def auto_loop():
                         """, (item_id,))
                         row = cur.fetchone()
                         conn.close()
+            
                         if not row:
                             log(f"❌ ID {item_id} не найден в trade_prices.")
-                            failed_ids.append(item_id)
+                            processed_all.append(item_id)
                             continue
             
                         row_id, name, base, mod, stat_id, item_type = row
-                        log(f"⚙ Форс-апдейт {row_id}: {name} ({base}), тип: {item_type}, мод: {mod}")
+                        log(f"⚙ Форс-апдейт {row_id}: {name} ({base}), мод: {mod}")
             
-                        results = search_items(name, base, league, 1, status, "да", stat_id, session_id)
-                        if not results:
-                            update_price_in_db(row_id, None, None, None, league)
-                            log("   Не найдено (форс-апдейт)")
+                        res = search_items(name, base, league, 1, status, "да", stat_id, session_id)
+            
+                        # count=0 — это НЕ ошибка
+                        if not res or not res["results"]:
+                            update_price_in_db(
+                                row_id,
+                                value=None,
+                                currency=None,
+                                seller=None,
+                                league=league,
+                                trade_count=res["trade_count"] if res else 0,
+                                trade_url=res["trade_url"] if res else None,
+                            )
+                            log(f"   🟡 Не найдено | count={res['trade_count'] if res else 0}")
                         else:
-                            value, currency, seller = parse_price_entry(results[0])
-                            update_price_in_db(row_id, value, currency, seller, league)
-                            log(f"   ✅ {value} {currency} (форс-апдейт, продавец: {seller})")
+                            entry = res["results"][0]
+                            value, currency, seller = parse_price_entry(entry)
+                            update_price_in_db(
+                                row_id,
+                                value=value,
+                                currency=currency,
+                                seller=seller,
+                                league=league,
+                                trade_count=res["trade_count"],
+                                trade_url=res["trade_url"],
+                            )
+                            log(f"   ✅ {value} {currency} (продавец: {seller})")
             
-                        success_ids.append(item_id)
+                        processed_all.append(item_id)
             
                     except Exception as e:
-                        log(f"❌ Ошибка при форс-апдейте {item_id}: {e}")
-                        failed_ids.append(item_id)
+                        log(f"❌ Ошибка форс-апдейта {item_id}: {e}")
+                        # всё равно считаем обработанным — иначе вечный цикл
+                        processed_all.append(item_id)
             
-                # успешно завершённые
-                if success_ids:
-                    mark_forced_done(success_ids)
-                    log(f"⚡ Успешно обновлено: {len(success_ids)}")
-            
-                # вернуть неудачные
-                if failed_ids:
+                # помечаем все как processed = TRUE
+                if processed_all:
                     conn = psycopg2.connect(**DB)
                     cur = conn.cursor()
                     cur.execute("""
                         UPDATE force_update_queue
-                        SET in_progress = FALSE
+                        SET processed = TRUE, in_progress = FALSE
                         WHERE item_id = ANY(%s);
-                    """, (failed_ids,))
+                    """, (processed_all,))
                     conn.commit()
                     conn.close()
-                    log(f"🔁 Возвращено на повторную обработку: {len(failed_ids)}")
             
-                continue  # к следующей итерации
+                    log(f"⚡ Завершено форс-обновлений: {len(processed_all)}")
+            
+                continue
+
 
             # каждые 2 минуты чистим неактивных воркеров и зависшие группы
             if now - last_recheck > 120:
