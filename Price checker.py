@@ -640,7 +640,7 @@ def get_item_types_from_db():
 
 def search_items(name, base, league="Keepers", limit=1, status="securable",
                  corrupted_choice="да", stat_id=None, session_id=None):
-    """Поиск предметов через PoE Trade API"""
+    """Поиск предметов через PoE Trade API c возвратом trade_count и trade_url."""
     query = {
         "status": {"option": status},
         "name": name,
@@ -649,14 +649,14 @@ def search_items(name, base, league="Keepers", limit=1, status="securable",
     }
 
     query.setdefault("filters", {"misc_filters": {"filters": {}}})
-    
+
     # Фильтр на порчу
     if corrupted_choice.lower() == "да":
         query["filters"]["misc_filters"]["filters"]["corrupted"] = {"option": True}
     elif corrupted_choice.lower() == "нет":
         query["filters"]["misc_filters"]["filters"]["corrupted"] = {"option": False}
 
-    # 🚫 Всегда исключаем Foulborn-предметы
+    # 🚫 Всегда исключаем foulborn
     query["filters"]["misc_filters"]["filters"]["foulborn_item"] = {"option": False}
 
     # Фильтр по модификатору
@@ -676,23 +676,45 @@ def search_items(name, base, league="Keepers", limit=1, status="securable",
     r = safe_request("POST", f"{TRADE_API}/search/{league}",
                      headers=headers, cookies=cookies, json=payload, timeout=15)
     data = r.json()
+
     ids = data.get("result", [])
+    query_id = data.get("id")
+    trade_url = f"https://www.pathofexile.com/trade/search/{league}/{query_id}" if query_id else None
+    trade_count = len(ids)
+
     elapsed = time.time() - start_time
-    log(f"Ответ ({len(ids)} id) за {elapsed:.2f} сек")
+    log(f"Ответ ({trade_count} id) за {elapsed:.2f} сек")
 
+    # если пусто
     if not ids:
-        return []
+        return {
+            "ids": [],
+            "results": [],
+            "query_id": query_id,
+            "trade_url": trade_url,
+            "trade_count": trade_count,
+        }
 
+    # иначе fetch
     results = []
     for i in range(0, min(limit, len(ids)), 10):
         chunk = ids[i:i + 10]
-        fetch_url = f"{TRADE_API}/fetch/{','.join(chunk)}?query={data['id']}"
+        fetch_url = f"{TRADE_API}/fetch/{','.join(chunk)}?query={query_id}"
+
         log(f"  Fetch {i+1}-{i+len(chunk)}")
         start_chunk = time.time()
         r2 = safe_request("GET", fetch_url, headers=headers, cookies=cookies, timeout=30)
         results.extend(r2.json().get("result", []))
-        log(f"  Получено {len(results)} результатов (+{len(chunk)}) за {time.time()-start_chunk:.2f} сек")
-    return results
+        log(f"  Получено {len(results)} (+{len(chunk)}) за {time.time()-start_chunk:.2f} сек")
+
+    return {
+        "ids": ids,
+        "results": results,
+        "query_id": query_id,
+        "trade_url": trade_url,
+        "trade_count": trade_count,
+    }
+
 
 
 
@@ -748,7 +770,8 @@ def get_next_row_after(last_id, item_type_filter=None):
 
 
 
-def update_price_in_db(row_id, value, currency, seller, league=DEFAULT_LEAGUE):
+def update_price_in_db(row_id, value, currency, seller, league=DEFAULT_LEAGUE,
+                       trade_count=None, trade_url=None):
     conn = psycopg2.connect(**DB)
     cur = conn.cursor()
     cur.execute("""
@@ -757,9 +780,12 @@ def update_price_in_db(row_id, value, currency, seller, league=DEFAULT_LEAGUE):
             currency_id = %s,
             seller_name = %s,
             league = %s,
+            trade_count = %s,
+            trade_url = %s,
             updated_at = NOW()
         WHERE id = %s;
-    """, (value, currency, seller, league, row_id))
+    """, (value, currency, seller, league,
+          trade_count, trade_url, row_id))
     conn.commit()
     conn.close()
 
@@ -1210,20 +1236,41 @@ def auto_loop():
                 log(f"→ {row_id}: {name} ({base}), тип: {item_type}, мод: {mod}")
             
                 try:
-                    results = search_items(name, base, league, 1, status, "да", stat_id, session_id)
-                    if not results:
-                        update_price_in_db(row_id, None, None, None, league)
-                        log("   Не найдено")
+                    res = search_items(name, base, league, 1, status, "да", stat_id, session_id)
+                
+                    # Нет результатов
+                    if not res or not res["results"]:
+                        update_price_in_db(
+                            row_id,
+                            value=None,
+                            currency=None,
+                            seller=None,
+                            league=league,
+                            trade_count=res["trade_count"] if res else None,
+                            trade_url=res["trade_url"] if res else None,
+                        )
+                        log(f"   Не найдено | count={res['trade_count'] if res else 0}")
+                
                     else:
-                        value, currency, seller = parse_price_entry(results[0])
-                        update_price_in_db(row_id, value, currency, seller, league)
+                        entry = res["results"][0]
+                        value, currency, seller = parse_price_entry(entry)
+                        update_price_in_db(
+                            row_id,
+                            value=value,
+                            currency=currency,
+                            seller=seller,
+                            league=league,
+                            trade_count=res["trade_count"],
+                            trade_url=res["trade_url"],
+                        )
                         processed_items += 1
-                        log(f"   {value} {currency} (продавец: {seller})")
+                        log(f"   {value} {currency} (продавец: {seller}) | count={res['trade_count']}")
+                
                 except Exception as e:
                     log(f"⚠ Ошибка при обработке {row_id}: {e}")
-                    # чтобы предмет не считался “выполненным” — повторим его позже
                     time.sleep(5)
                     continue
+
 
 
             # --- завершение группы ---
